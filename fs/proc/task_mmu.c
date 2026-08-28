@@ -22,6 +22,9 @@
 #include <linux/shmem_fs.h>
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
+#include <linux/hex.h>
+#include <linux/sprintf.h>
+#include <linux/dcache.h>
 #include <trace/hooks/mm.h>
 
 #include <asm/elf.h>
@@ -369,6 +372,287 @@ static int do_maps_open(struct inode *inode, struct file *file,
 				sizeof(struct proc_maps_private));
 }
 
+/*
+ * Micro-optimized PID maps output for arm64.
+ * This replaces the generic show_vma_header_prefix/show_map_vma
+ * with arm64-specific fast paths when CONFIG_ARM64_VA_BITS <= 40.
+ */
+#if defined(CONFIG_ARM64) && defined(CONFIG_ARM64_VA_BITS) && (CONFIG_ARM64_VA_BITS <= 40)
+
+#define print_vma_hex10(out, val, clz_fn) \
+({ \
+	const typeof(val) __val = val; \
+	char *const __out = out; \
+	size_t __len; \
+\
+	if (__val) { \
+		__len = (sizeof(__val) * 8 - clz_fn(__val) + 3) / 4; \
+		switch (__len) { \
+		case 10: \
+			__out[9] = hex_asc[(__val >> 0) & 0xf]; \
+			__out[8] = hex_asc[(__val >> 4) & 0xf]; \
+			__out[7] = hex_asc[(__val >> 8) & 0xf]; \
+			__out[6] = hex_asc[(__val >> 12) & 0xf]; \
+			__out[5] = hex_asc[(__val >> 16) & 0xf]; \
+			__out[4] = hex_asc[(__val >> 20) & 0xf]; \
+			__out[3] = hex_asc[(__val >> 24) & 0xf]; \
+			__out[2] = hex_asc[(__val >> 28) & 0xf]; \
+			__out[1] = hex_asc[(__val >> 32) & 0xf]; \
+			__out[0] = hex_asc[(__val >> 36) & 0xf]; \
+			break; \
+		case 9: \
+			__out[8] = hex_asc[(__val >> 0) & 0xf]; \
+			__out[7] = hex_asc[(__val >> 4) & 0xf]; \
+			__out[6] = hex_asc[(__val >> 8) & 0xf]; \
+			__out[5] = hex_asc[(__val >> 12) & 0xf]; \
+			__out[4] = hex_asc[(__val >> 16) & 0xf]; \
+			__out[3] = hex_asc[(__val >> 20) & 0xf]; \
+			__out[2] = hex_asc[(__val >> 24) & 0xf]; \
+			__out[1] = hex_asc[(__val >> 28) & 0xf]; \
+			__out[0] = hex_asc[(__val >> 32) & 0xf]; \
+			break; \
+		default: \
+			__out[7] = hex_asc[(__val >> 0) & 0xf]; \
+			__out[6] = hex_asc[(__val >> 4) & 0xf]; \
+			__out[5] = hex_asc[(__val >> 8) & 0xf]; \
+			__out[4] = hex_asc[(__val >> 12) & 0xf]; \
+			__out[3] = hex_asc[(__val >> 16) & 0xf]; \
+			__out[2] = hex_asc[(__val >> 20) & 0xf]; \
+			__out[1] = hex_asc[(__val >> 24) & 0xf]; \
+			__out[0] = hex_asc[(__val >> 28) & 0xf]; \
+			__len = 8; \
+			break; \
+		} \
+	} else { \
+		*(u64 *)__out = 0x3030303030303030ULL; \
+		__len = 8; \
+	} \
+\
+	__len; \
+})
+
+#define print_vma_hex5(out, val, clz_fn) \
+({ \
+	const typeof(val) __val = val; \
+	char *const __out = out; \
+	size_t __len; \
+\
+	if (__val) { \
+		__len = (sizeof(__val) * 8 - clz_fn(__val) + 3) / 4; \
+		switch (__len) { \
+		case 5: \
+			__out[4] = hex_asc[(__val >> 0) & 0xf]; \
+			__out[3] = hex_asc[(__val >> 4) & 0xf]; \
+			__out[2] = hex_asc[(__val >> 8) & 0xf]; \
+			__out[1] = hex_asc[(__val >> 12) & 0xf]; \
+			__out[0] = hex_asc[(__val >> 16) & 0xf]; \
+			break; \
+		case 4: \
+			__out[3] = hex_asc[(__val >> 0) & 0xf]; \
+			__out[2] = hex_asc[(__val >> 4) & 0xf]; \
+			__out[1] = hex_asc[(__val >> 8) & 0xf]; \
+			__out[0] = hex_asc[(__val >> 12) & 0xf]; \
+			break; \
+		case 3: \
+			__out[2] = hex_asc[(__val >> 0) & 0xf]; \
+			__out[1] = hex_asc[(__val >> 4) & 0xf]; \
+			__out[0] = hex_asc[(__val >> 8) & 0xf]; \
+			break; \
+		default: \
+			__out[1] = hex_asc[(__val >> 0) & 0xf]; \
+			__out[0] = hex_asc[(__val >> 4) & 0xf]; \
+			__len = 2; \
+			break; \
+		} \
+	} else { \
+		*(u16 *)__out = 0x3030; \
+		__len = 2; \
+	} \
+\
+	__len; \
+})
+
+#define print_vma_hex3(out, val, clz_fn) \
+({ \
+	const typeof(val) __val = val; \
+	char *const __out = out; \
+	size_t __len; \
+\
+	if (__val & 0xf00) { \
+		__out[2] = hex_asc[(__val >> 0) & 0xf]; \
+		__out[1] = hex_asc[(__val >> 4) & 0xf]; \
+		__out[0] = hex_asc[(__val >> 8) & 0xf]; \
+		__len = 3; \
+	} else { \
+		__out[1] = hex_asc[(__val >> 0) & 0xf]; \
+		__out[0] = hex_asc[(__val >> 4) & 0xf]; \
+		__len = 2; \
+	} \
+\
+	__len; \
+})
+
+static int is_stack(struct vm_area_struct *vma)
+{
+	return vma->vm_start <= vma->vm_mm->start_stack &&
+	       vma->vm_end >= vma->vm_mm->start_stack;
+}
+
+static int show_vma_header_prefix(struct seq_file *m, unsigned long start,
+				  unsigned long end, vm_flags_t flags,
+				  unsigned long long pgoff, dev_t dev,
+				  unsigned long ino)
+{
+	size_t len;
+	char *out;
+
+	if (seq_get_buf(m, &out) < 69) {
+		seq_commit(m, -1);
+		return -ENOMEM;
+	}
+
+	BUILD_BUG_ON(CONFIG_ARM64_VA_BITS > 40);
+
+	len = print_vma_hex10(out, start, __builtin_clzl);
+
+	out[len++] = '-';
+
+	len += print_vma_hex10(out + len, end, __builtin_clzl);
+
+	out[len++] = ' ';
+	out[len++] = "-r"[!!(flags & VM_READ)];
+	out[len++] = "-w"[!!(flags & VM_WRITE)];
+	out[len++] = "-x"[!!(flags & VM_EXEC)];
+	out[len++] = "ps"[!!(flags & VM_MAYSHARE)];
+	out[len++] = ' ';
+
+	len += print_vma_hex10(out + len, pgoff, __builtin_clzll);
+
+	out[len++] = ' ';
+
+	len += print_vma_hex3(out + len, MAJOR(dev), __builtin_clz);
+
+	out[len++] = ':';
+
+	len += print_vma_hex5(out + len, MINOR(dev), __builtin_clz);
+
+	out[len++] = ' ';
+
+	len += num_to_str(&out[len], 20, ino, 0);
+
+	out[len++] = ' ';
+
+	m->count += len;
+	return 0;
+}
+
+static void show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+{
+	struct anon_vma_name *anon_name = NULL;
+	struct mm_struct *mm = vma->vm_mm;
+	struct file *file = vma->vm_file;
+	vm_flags_t flags = vma->vm_flags;
+	unsigned long ino = 0;
+	unsigned long long pgoff = 0;
+	unsigned long start, end;
+	dev_t dev = 0;
+	const char *name = NULL;
+
+	if (file) {
+		struct inode *inode = file_inode(vma->vm_file);
+		dev = inode->i_sb->s_dev;
+		ino = inode->i_ino;
+		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+	}
+
+	start = vma->vm_start;
+	end = VMA_PAD_START(vma);
+
+	if (flags & __VM_NO_COMPAT)
+		return;
+
+	__fold_filemap_fixup_entry(&((struct proc_maps_private *)m->private)->iter, &end);
+
+	if (show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino))
+		return;
+
+	if (mm)
+		anon_name = anon_vma_name(vma);
+
+	if (file) {
+		if (anon_name) {
+			seq_putc(m, ' ');
+			seq_printf(m, "[anon_shmem:%s]\n", anon_name->name);
+			return;
+		}
+
+		{
+			char *buf;
+			size_t size = seq_get_buf(m, &buf);
+
+			if (size > 1) {
+				char *p;
+
+				p = d_path(&file->f_path, buf, size);
+				if (!IS_ERR(p)) {
+					size_t len;
+
+					len = size - (p - buf) - 1;
+					if (likely(p > buf))
+						memmove(buf, p, len);
+					buf[len] = '\n';
+					seq_commit(m, len + 1);
+					return;
+				}
+			}
+
+			seq_commit(m, -1);
+			return;
+		}
+	}
+
+	if (vma->vm_ops && vma->vm_ops->name) {
+		name = vma->vm_ops->name(vma);
+		if (name) {
+			seq_write(m, name, strlen(name));
+			seq_putc(m, '\n');
+			return;
+		}
+	}
+
+	name = arch_vma_name(vma);
+	if (!name) {
+		if (!mm) {
+			seq_write(m, "[vdso]\n", 7);
+			return;
+		}
+
+		if (vma->vm_start <= mm->brk && vma->vm_end >= mm->start_brk) {
+			seq_write(m, "[heap]\n", 7);
+			return;
+		}
+
+		if (is_stack(vma)) {
+			seq_write(m, "[stack]\n", 8);
+			return;
+		}
+
+		if (anon_name) {
+			seq_write(m, "[anon:", 6);
+			seq_puts(m, anon_name->name);
+			seq_write(m, "]\n", 2);
+			return;
+		}
+	}
+
+	if (name) {
+		seq_write(m, name, strlen(name));
+	}
+	seq_putc(m, '\n');
+}
+
+#else /* !CONFIG_ARM64 || CONFIG_ARM64_VA_BITS > 40 */
+
 static void show_vma_header_prefix(struct seq_file *m,
 				   unsigned long start, unsigned long end,
 				   vm_flags_t flags, unsigned long long pgoff,
@@ -412,22 +696,6 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 	start = vma->vm_start;
 	end = VMA_PAD_START(vma);
 
-	/*
-	 * The seq_file iterator for /proc/pid/maps can be interrupted and
-	 * restarted. The restart logic uses the vm_end of the last VMA as
-	 * the new position (see get_vma_at_pos()).
-	 *
-	 * In page size compatibility mode, this can cause the scan to restart
-	 * exactly at an anonymous "fixup" VMA (__VM_NO_COMPAT). However, the
-	 * logic in __fold_filemap_fixup_entry() depends on processing the
-	 * main file-backed VMA first to correctly fold the subsequent fixup
-	 * VMA into it.
-	 *
-	 * If we start on a fixup VMA, the folding is missed, and it gets
-	 * printed as a separate, overlapping map. To prevent this, simply
-	 * skip printing these entries. They are only meant to be merged with
-	 * their preceding VMA, not displayed directly.
-	 */
 	if (flags & __VM_NO_COMPAT)
 		return;
 
@@ -437,16 +705,8 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 	if (mm)
 		anon_name = anon_vma_name(vma);
 
-	/*
-	 * Print the dentry name for named mappings, and a
-	 * special [heap] marker for the heap:
-	 */
 	if (file) {
 		seq_pad(m, ' ');
-		/*
-		 * If user named this anon shared memory via
-		 * prctl(PR_SET_VMA ..., use the provided name.
-		 */
 		if (anon_name)
 			seq_printf(m, "[anon_shmem:%s]", anon_name->name);
 		else
@@ -490,6 +750,8 @@ done:
 	}
 	seq_putc(m, '\n');
 }
+
+#endif
 
 static int show_map(struct seq_file *m, void *v)
 {
@@ -2314,3 +2576,4 @@ const struct file_operations proc_pid_numa_maps_operations = {
 };
 
 #endif /* CONFIG_NUMA */
+
