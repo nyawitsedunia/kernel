@@ -211,6 +211,7 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq;
 	unsigned long next_freq = 0;
+	unsigned int resolved_freq;
 
 	freq = get_capacity_ref_freq(policy);
 	util = map_util_perf(util);
@@ -225,7 +226,21 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		return sg_policy->next_freq;
 
 	sg_policy->cached_raw_freq = freq;
-	return cpufreq_driver_resolve_freq(policy, freq);
+
+	resolved_freq = cpufreq_driver_resolve_freq(policy, freq);
+	
+	/*
+	 * If the target frequency is less than 20% above the lower frequency,
+	 * use that lower frequency.
+	 */
+	if (resolved_freq > freq) {
+		unsigned int l_freq = cpufreq_driver_resolve_freq(policy, freq - 1);
+
+		if (freq - l_freq < l_freq / 5)
+			resolved_freq = l_freq;
+	}
+
+	return resolved_freq;
 }
 
 static void sugov_get_util(struct sugov_cpu *sg_cpu)
